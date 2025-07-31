@@ -4,8 +4,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use automerge::{Automerge, ReadDoc, transaction::Transactable};
 use clap::Parser;
+use hex::{decode, encode};
 use iroh::NodeId;
 use iroh_automerge_repo::IrohRepo;
+
 use samod::{DocumentId, PeerId, Samod, storage::TokioFilesystemStorage};
 use tokio::sync::Mutex;
 
@@ -19,6 +21,10 @@ struct Args {
     /// Path where storage files will be created
     #[clap(long, default_value = ".")]
     config_path: String,
+
+    /// Print the secret key
+    #[clap(long)]
+    print_secret_key: bool,
 
     #[clap(subcommand)]
     command: Commands,
@@ -76,13 +82,71 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let endpoint = iroh::Endpoint::builder().discovery_n0().bind().await?;
+    // Pull in the secret key from the environment variable if it exists
+    // This key is the public Node ID used to identify the node in the network
+    // If not provided, a random key will be generated, and a new Node ID will
+    // be assigned each time the app is started
+    let secret_key = match std::env::var("IROH_NODE_SECRET_KEY") {
+        Ok(key_hex) => match decode(&key_hex) {
+            Ok(key_bytes) => {
+                if key_bytes.len() == 32 {
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&key_bytes);
+                    Some(iroh::SecretKey::from_bytes(&bytes))
+                } else {
+                    println!(
+                        "invalid IROH_NODE_SECRET_KEY provided: expected 32 bytes, got {}",
+                        key_bytes.len()
+                    );
+                    None
+                }
+            }
+            Err(_) => {
+                println!("invalid IROH_NODE_SECRET_KEY provided: not valid hex");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    match secret_key {
+        Some(ref key) => {
+            println!("Using existing key: {}", key.public());
+        }
+        None => {
+            println!("Generating new key");
+        }
+    }
+
+    let mut rng = rand::rngs::OsRng;
+    let _key = iroh::SecretKey::generate(&mut rng);
+
+    let secret_key = secret_key.unwrap_or_else(|| _key);
+
+    if args.print_secret_key {
+        println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        println!("Secret Key: {}", encode(secret_key.to_bytes()));
+        println!(
+            "Set env var for persistent Node ID: export IROH_NODE_SECRET_KEY={}",
+            encode(secret_key.to_bytes())
+        );
+        println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    }
+
+    let endpoint = iroh::Endpoint::builder()
+        .discovery_n0()
+        .secret_key(secret_key)
+        .bind()
+        .await?;
+
+    println!("Node ID: {}", endpoint.node_id());
 
     let samod = Samod::build_tokio()
         .with_peer_id(PeerId::from_string(endpoint.node_id().to_string()))
         .with_storage(TokioFilesystemStorage::new(format!(
-            "{}/automerge.data",
-            args.config_path
+            "{}/{}",
+            args.config_path,
+            endpoint.node_id()
         )))
         .load()
         .await;
